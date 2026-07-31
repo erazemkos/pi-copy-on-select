@@ -104,3 +104,7 @@ Tests are plain `node:test` files with no build step and no pi installation requ
 ## License
 
 MIT © erazemkos
+
+## Notes for packagers
+
+pi bundles `@earendil-works/pi-coding-agent` and `@earendil-works/pi-tui` and injects them into extensions. They are declared as optional peer dependencies so `npm install` inside a git clone of this package does not download a second copy of pi.
