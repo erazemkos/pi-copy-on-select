@@ -320,6 +320,67 @@ test("installing twice does not double-handle input", () => {
 	assert.deepEqual(h.clipboard, ["first"]);
 });
 
+test("a reloaded runtime takes over the hooks from the previous one", () => {
+	// Mirrors /reload: same TUI, fresh runtime instance with fresh config.
+	const first = harness({ clearSelection: "keep", toast: false });
+	const secondClipboard: string[] = [];
+	const second = new CopyOnSelectRuntime({
+		measure,
+		copyToClipboard: async (text) => {
+			secondClipboard.push(text);
+		},
+		readConfig: () => ({ ...DEFAULT_CONFIG, clearSelection: "delayed", delayMs: 300 }),
+		setTimer: first.clock.set,
+		clearTimer: first.clock.clear,
+	});
+
+	const session = new FakeSession();
+	second.startSession(session);
+	session.widgets.get("copy-on-select-capture")?.(first.tui, session.ui.theme);
+
+	assert.ok(second.isActive(), "the new runtime owns the hooks");
+	assert.ok(!first.runtime.isActive(), "the old runtime steps aside");
+
+	first.frame();
+	first.drag(1, 1, 6, 1);
+
+	assert.deepEqual(secondClipboard, ["first"], "the new runtime handles input");
+	assert.deepEqual(first.clipboard, [], "the stale runtime no longer acts");
+	assert.ok(first.toastRow(), "the new config's toast is used");
+	assert.ok(first.tui.compositor.selection, "the new config's delayed clearing is used");
+
+	first.clock.advance(300);
+	assert.equal(first.tui.compositor.selection, null);
+});
+
+test("a torn down and rebuilt editor render hook is re-asserted", () => {
+	const h = harness();
+	const piRender = (_width: number): string[] => h.tui.compositor.lines;
+
+	// Mirrors pi-powerline-footer reinstalling its compositor: it restores the render
+	// hook it captured (dropping ours), then installs its own again.
+	h.tui.render = piRender;
+	const editorRender = (width: number): string[] => piRender(width);
+	h.tui.render = editorRender;
+
+	h.drag(1, 1, 6, 1);
+
+	assert.notEqual(h.tui.render, editorRender, "our wrapper is outermost again");
+	assert.deepEqual(h.clipboard, ["first"], "selection handling recovers");
+});
+
+test("status reports hook and mouse ownership", () => {
+	const h = harness();
+	h.frame();
+
+	const status = h.runtime.handleCommand("status", h.session);
+
+	assert.equal(status.level, "info");
+	assert.match(status.message, /hooks owned/);
+	assert.match(status.message, /mouse owned by editor/);
+	assert.match(status.message, /frame 3 rows/);
+});
+
 test("command toggles behavior and reports status", () => {
 	const h = harness();
 

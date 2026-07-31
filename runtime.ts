@@ -11,7 +11,14 @@ import { parseSgrMousePackets, SelectionTracker } from "./selection.ts";
 import { compositeLineFallback, paintToast } from "./toast.ts";
 
 const CAPTURE_WIDGET_KEY = "copy-on-select-capture";
-const INSTALL_FLAG = "__piCopyOnSelectInstalled";
+/**
+ * Hooks are stored on the TUI under a global symbol. `/reload` re-imports this
+ * module, so a module-local symbol or flag would leave the previous (now stale)
+ * runtime owning the hooks while the fresh one sits idle with the new config.
+ */
+const HOOKS_KEY = Symbol.for("pi-copy-on-select.hooks");
+/** Marker used by pre-0.3 releases, whose hooks cannot be handed over. */
+const LEGACY_FLAG = "__piCopyOnSelectInstalled";
 /** Column 2 keeps the synthetic click inside the content area for any output padding. */
 const SYNTHETIC_CLICK_COL = 2;
 /** Row 1 is always inside the scrollable chat viewport. */
@@ -29,6 +36,19 @@ export interface TuiLike {
 	hasOverlay?(): boolean;
 	compositeLineAt?(baseLine: string, overlayLine: string, startCol: number, overlayWidth: number, totalWidth: number): string;
 	terminal?: TerminalLike;
+}
+
+interface TuiHooks {
+	/** Runtime currently responsible for handling hook callbacks. */
+	owner: CopyOnSelectRuntime;
+	originalHandleInput: (data: string) => void;
+	renderWrapper: ((width: number) => string[]) | null;
+	replaying: boolean;
+	/**
+	 * Last rendered viewport. Lives on the hooks rather than the runtime so a
+	 * reloaded instance can read selections before the next frame is drawn.
+	 */
+	frame: readonly string[];
 }
 
 export interface WidgetComponent {
@@ -88,8 +108,7 @@ export class CopyOnSelectRuntime {
 	private config: CopyOnSelectConfig = { ...DEFAULT_CONFIG };
 	private session: SessionLike | null = null;
 	private tui: TuiLike | null = null;
-	private viewportLines: readonly string[] = [];
-	private renderWrapper: ((width: number) => string[]) | null = null;
+	private hooks: TuiHooks | null = null;
 	private toastLabel: string | null = null;
 	private pendingClear: unknown = null;
 	private pendingToast: unknown = null;
@@ -103,6 +122,11 @@ export class CopyOnSelectRuntime {
 
 	getConfig(): CopyOnSelectConfig {
 		return { ...this.config };
+	}
+
+	/** True while this runtime owns the TUI hooks. */
+	isActive(): boolean {
+		return this.hooks !== null && this.hooks.owner === this;
 	}
 
 	/** Called on `session_start`: refreshes config and installs the capture widget. */
@@ -123,7 +147,7 @@ export class CopyOnSelectRuntime {
 	/** Called on `session_shutdown`: drops timers and UI owned by this session. */
 	stopSession(): void {
 		this.cancelTimers();
-		this.hideToast();
+		this.clearToast();
 		this.tracker.reset();
 		this.session = null;
 	}
@@ -137,19 +161,21 @@ export class CopyOnSelectRuntime {
 			this.config = { ...this.config, enabled: command === "on" };
 			if (!this.config.enabled) {
 				this.cancelTimers();
-				this.hideToast();
+				this.clearToast();
 				this.tracker.reset();
 			}
 		} else if (command === "toast on" || command === "toast off") {
 			this.config = { ...this.config, toast: command === "toast on" };
-			if (!this.config.toast) this.hideToast();
+			if (!this.config.toast) this.clearToast();
 		} else if (command === "clear immediate" || command === "clear delayed" || command === "clear keep") {
 			this.config = { ...this.config, clearSelection: command.slice("clear ".length) as ClearSelectionMode };
 		} else if (command === "reload") {
 			this.config = this.deps.readConfig(session.cwd);
+		} else if (command === "status" || command === "debug") {
+			return { message: this.describeState(), level: "info" };
 		} else if (command.length > 0) {
 			return {
-				message: `Unknown argument: ${command}. Use on|off|toast on|toast off|clear immediate|clear delayed|clear keep|reload`,
+				message: `Unknown argument: ${command}. Use on|off|toast on|toast off|clear immediate|clear delayed|clear keep|reload|status`,
 				level: "warning",
 			};
 		}
@@ -161,82 +187,125 @@ export class CopyOnSelectRuntime {
 		return { message: describeConfig(this.config), level: "info" };
 	}
 
-	/** Wraps TUI input and rendering. Safe to call repeatedly for the same TUI. */
-	install(tui: TuiLike): void {
-		const flagged = tui as TuiLike & { [INSTALL_FLAG]?: boolean };
-		this.tui = tui;
-		if (flagged[INSTALL_FLAG]) return;
-		flagged[INSTALL_FLAG] = true;
+	/** Diagnostics for `/copy-on-select status`. */
+	describeState(): string {
+		const tui = this.tui;
+		const legacy = tui !== null && (tui as TuiLike & { [LEGACY_FLAG]?: boolean })[LEGACY_FLAG] === true;
+		const parts = [
+			describeConfig(this.config),
+			`hooks ${this.isActive() ? "owned" : this.hooks ? "handed over" : "missing"}`,
+			...(legacy ? ["pre-0.3 hooks still attached, restart pi"] : []),
+			`mouse ${tui && ownsMouseReporting(tui) ? "owned by editor" : "not captured"}`,
+			`frame ${this.hooks?.frame.length ?? 0} rows`,
+			`toast ${this.toastLabel === null ? "idle" : "showing"}`,
+		];
 
-		const originalHandleInput = tui.handleInput.bind(tui);
-		let replaying = false;
-
-		const replay = (data: string): void => {
-			replaying = true;
-			try {
-				originalHandleInput(data);
-			} finally {
-				replaying = false;
-			}
-		};
-
-		this.wrapRender(tui);
-
-		tui.handleInput = (data: string): void => {
-			if (replaying) {
-				originalHandleInput(data);
-				return;
-			}
-
-			// The editor that owns the viewport may reinstall its own render hook.
-			this.wrapRender(tui);
-
-			const active = this.config.enabled && ownsMouseReporting(tui) && !hasVisibleOverlay(tui);
-			if (!active) this.tracker.reset();
-
-			let copied: string | null = null;
-			if (active) {
-				for (const packet of parseSgrMousePackets(data)) {
-					copied = this.tracker.handlePacket(packet, this.viewportLines) ?? copied;
-				}
-			}
-
-			originalHandleInput(data);
-
-			if (copied !== null) this.onSelectionCopied(copied, tui, replay);
-		};
+		return parts.join(" · ");
 	}
 
 	/**
-	 * Captures what the viewport currently shows (for selection text) and paints the
-	 * toast into the bottom-right corner of the same frame.
+	 * Installs (or takes over) the TUI hooks. Safe to call repeatedly, including
+	 * after `/reload`, when a fresh runtime must replace the previous owner.
 	 */
-	private wrapRender(tui: TuiLike): void {
-		const currentRender = tui.render;
-		if (typeof currentRender !== "function" || currentRender === this.renderWrapper) return;
+	install(tui: TuiLike): void {
+		this.tui = tui;
 
-		const originalRender = currentRender.bind(tui);
-		this.renderWrapper = (width: number): string[] => {
-			const lines = originalRender(width);
-			this.viewportLines = lines;
+		const store = tui as TuiLike & { [HOOKS_KEY]?: TuiHooks };
+		const existing = store[HOOKS_KEY];
+		if (existing) {
+			if (existing.owner !== this) {
+				existing.owner.handOver();
+				existing.owner = this;
+			}
+			this.hooks = existing;
+			this.assertRenderHook(tui, existing);
+			return;
+		}
 
-			const label = this.toastLabel;
-			if (label === null) return lines;
-
-			const composite = tui.compositeLineAt?.bind(tui) ?? compositeLineFallback;
-			return paintToast(lines, width, { label, measure: this.deps.measure, composite });
+		const hooks: TuiHooks = {
+			owner: this,
+			originalHandleInput: tui.handleInput.bind(tui),
+			renderWrapper: null,
+			replaying: false,
+			frame: [],
 		};
-		tui.render = this.renderWrapper;
+		store[HOOKS_KEY] = hooks;
+		this.hooks = hooks;
+
+		tui.handleInput = (data: string): void => {
+			if (hooks.replaying) {
+				hooks.originalHandleInput(data);
+				return;
+			}
+			hooks.owner.onInput(tui, hooks, data);
+		};
+
+		this.assertRenderHook(tui, hooks);
 	}
 
-	private onSelectionCopied(text: string, tui: TuiLike, replay: (data: string) => void): void {
+	/** Called on the outgoing runtime when a newer one takes over the hooks. */
+	private handOver(): void {
+		this.cancelTimers();
+		this.toastLabel = null;
+		this.hooks = null;
+		this.session = null;
+	}
+
+	/**
+	 * Re-asserts the render hook as the outermost wrapper. The surrounding editor
+	 * tears its own render hook down and rebuilds it (first keypress, `/powerline`
+	 * commands, resizes), which drops ours, so this runs on every input.
+	 */
+	private assertRenderHook(tui: TuiLike, hooks: TuiHooks): void {
+		const currentRender = tui.render;
+		if (typeof currentRender !== "function" || currentRender === hooks.renderWrapper) return;
+
+		const originalRender = currentRender.bind(tui);
+		hooks.renderWrapper = (width: number): string[] => hooks.owner.onFrame(tui, hooks, originalRender(width), width);
+		tui.render = hooks.renderWrapper;
+	}
+
+	/** Handles one raw input chunk before the TUI dispatches it. */
+	private onInput(tui: TuiLike, hooks: TuiHooks, data: string): void {
+		this.assertRenderHook(tui, hooks);
+
+		const active = this.config.enabled && ownsMouseReporting(tui) && !hasVisibleOverlay(tui);
+		if (!active) this.tracker.reset();
+
+		let copied: string | null = null;
+		if (active) {
+			for (const packet of parseSgrMousePackets(data)) {
+				copied = this.tracker.handlePacket(packet, hooks.frame) ?? copied;
+			}
+		}
+
+		hooks.originalHandleInput(data);
+
+		if (copied !== null) this.onSelectionCopied(copied, tui, hooks);
+	}
+
+	/**
+	 * Records the rendered viewport (used to read selected text) and paints the
+	 * toast into the bottom-right corner of the same frame.
+	 */
+	private onFrame(tui: TuiLike, hooks: TuiHooks, lines: string[], width: number): string[] {
+		hooks.frame = lines;
+
+		const label = this.toastLabel;
+		if (label === null) return lines;
+
+		const composite = tui.compositeLineAt?.bind(tui) ?? compositeLineFallback;
+		return paintToast(lines, width, { label, measure: this.deps.measure, composite });
+	}
+
+	private onSelectionCopied(text: string, tui: TuiLike, hooks: TuiHooks): void {
 		if (this.config.copy) {
 			void this.deps.copyToClipboard(text).catch(() => {
 				/* Clipboard tooling can be unavailable; the highlight still clears. */
 			});
 		}
 		if (this.config.toast) this.showToast(tui);
-		this.scheduleClear(() => this.clearHighlight(tui, replay));
+		this.scheduleClear(() => this.clearHighlight(tui, hooks));
 	}
 
 	private scheduleClear(run: () => void): void {
@@ -256,11 +325,16 @@ export class CopyOnSelectRuntime {
 	}
 
 	/** Replays a zero-width click so the editor that owns the highlight drops it. */
-	private clearHighlight(tui: TuiLike, replay: (data: string) => void): void {
+	private clearHighlight(tui: TuiLike, hooks: TuiHooks): void {
 		if (!ownsMouseReporting(tui) || hasVisibleOverlay(tui)) return;
 
-		replay(`\x1b[<0;${SYNTHETIC_CLICK_COL};${SYNTHETIC_CLICK_ROW}M`);
-		replay(`\x1b[<0;${SYNTHETIC_CLICK_COL};${SYNTHETIC_CLICK_ROW}m`);
+		hooks.replaying = true;
+		try {
+			hooks.originalHandleInput(`\x1b[<0;${SYNTHETIC_CLICK_COL};${SYNTHETIC_CLICK_ROW}M`);
+			hooks.originalHandleInput(`\x1b[<0;${SYNTHETIC_CLICK_COL};${SYNTHETIC_CLICK_ROW}m`);
+		} finally {
+			hooks.replaying = false;
+		}
 	}
 
 	private showToast(tui: TuiLike): void {
@@ -274,11 +348,11 @@ export class CopyOnSelectRuntime {
 
 		this.pendingToast = this.setTimer(() => {
 			this.pendingToast = null;
-			this.hideToast();
+			this.clearToast();
 		}, this.config.toastMs);
 	}
 
-	private hideToast(): void {
+	private clearToast(): void {
 		if (this.pendingToast) this.clearTimer(this.pendingToast);
 		this.pendingToast = null;
 		if (this.toastLabel === null) return;

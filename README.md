@@ -87,6 +87,7 @@ Session-local overrides; settings files stay untouched.
 | `/copy-on-select toast on` \| `toast off` | Toggle the toast |
 | `/copy-on-select clear immediate` \| `clear delayed` \| `clear keep` | Change highlight clearing |
 | `/copy-on-select reload` | Re-read settings from disk |
+| `/copy-on-select status` | Report config plus hook/mouse ownership (useful when something looks inert) |
 
 ## How it works
 
@@ -95,6 +96,8 @@ Session-local overrides; settings files stay untouched.
 3. On release it maps screen coordinates onto that snapshot, slices the selected columns (grapheme- and wide-character aware), strips ANSI, and copies the text.
 4. The highlight is dropped by replaying a zero-width click, which the owning editor reads as "clicked without selecting".
 5. The toast is composited onto the tail of an existing bottom row (using pi-tui's `compositeLineAt`), preferring a row whose right side is blank. Nothing is added to the layout, so no content moves and no overlay is created — visible overlays would make the owning editor release mouse ownership.
+
+Hook ownership matters here. Editors like pi-powerline-footer tear down and rebuild their own render hook (first keypress, `/powerline ...`, resizes), and `/reload` re-imports this extension while the TUI object survives. The hooks are therefore stored on the TUI under a global symbol: the render hook is re-asserted as the outermost wrapper on every input, and a reloaded instance takes ownership from the previous one instead of stacking on top of it or sitting idle behind it.
 
 Safety rails:
 

@@ -1,6 +1,6 @@
 {
   "name": "pi-copy-on-select",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Copy-on-select for the pi coding agent: mouse selections land on the clipboard, a bottom-right toast confirms it, and the highlight clears itself",
   "type": "module",
   "license": "MIT",
