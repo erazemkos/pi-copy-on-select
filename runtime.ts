@@ -7,6 +7,7 @@
  */
 
 import { type ClearSelectionMode, type CopyOnSelectConfig, DEFAULT_CONFIG, describeConfig } from "./config.ts";
+import { applyFade, fadeStepMs } from "./fade.ts";
 import { parseSgrMousePackets, SelectionTracker } from "./selection.ts";
 import { compositeLineFallback, paintToast } from "./toast.ts";
 
@@ -110,8 +111,11 @@ export class CopyOnSelectRuntime {
 	private tui: TuiLike | null = null;
 	private hooks: TuiHooks | null = null;
 	private toastLabel: string | null = null;
+	/** Index into `config.fadeColors` while a fade is running, else null. */
+	private fadeStep: number | null = null;
 	private pendingClear: unknown = null;
 	private pendingToast: unknown = null;
+	private pendingFade: unknown = null;
 
 	constructor(deps: RuntimeDeps) {
 		this.deps = deps;
@@ -167,7 +171,12 @@ export class CopyOnSelectRuntime {
 		} else if (command === "toast on" || command === "toast off") {
 			this.config = { ...this.config, toast: command === "toast on" };
 			if (!this.config.toast) this.clearToast();
-		} else if (command === "clear immediate" || command === "clear delayed" || command === "clear keep") {
+		} else if (
+			command === "clear immediate"
+			|| command === "clear fade"
+			|| command === "clear delayed"
+			|| command === "clear keep"
+		) {
 			this.config = { ...this.config, clearSelection: command.slice("clear ".length) as ClearSelectionMode };
 		} else if (command === "reload") {
 			this.config = this.deps.readConfig(session.cwd);
@@ -175,7 +184,7 @@ export class CopyOnSelectRuntime {
 			return { message: this.describeState(), level: "info" };
 		} else if (command.length > 0) {
 			return {
-				message: `Unknown argument: ${command}. Use on|off|toast on|toast off|clear immediate|clear delayed|clear keep|reload|status`,
+				message: `Unknown argument: ${command}. Use on|off|toast on|toast off|clear immediate|clear fade|clear delayed|clear keep|reload|status`,
 				level: "warning",
 			};
 		}
@@ -198,6 +207,7 @@ export class CopyOnSelectRuntime {
 			`mouse ${tui && ownsMouseReporting(tui) ? "owned by editor" : "not captured"}`,
 			`frame ${this.hooks?.frame.length ?? 0} rows`,
 			`toast ${this.toastLabel === null ? "idle" : "showing"}`,
+			`fade ${this.fadeStep === null ? "idle" : `step ${this.fadeStep + 1}/${this.config.fadeColors.length}`}`,
 		];
 
 		return parts.join(" · ");
@@ -247,6 +257,7 @@ export class CopyOnSelectRuntime {
 	private handOver(): void {
 		this.cancelTimers();
 		this.toastLabel = null;
+		this.fadeStep = null;
 		this.hooks = null;
 		this.session = null;
 	}
@@ -291,11 +302,22 @@ export class CopyOnSelectRuntime {
 	private onFrame(tui: TuiLike, hooks: TuiHooks, lines: string[], width: number): string[] {
 		hooks.frame = lines;
 
-		const label = this.toastLabel;
-		if (label === null) return lines;
+		let painted = lines;
 
-		const composite = tui.compositeLineAt?.bind(tui) ?? compositeLineFallback;
-		return paintToast(lines, width, { label, measure: this.deps.measure, composite });
+		// Repaint the reverse-video selection as a dimming background while fading.
+		const fadeStep = this.fadeStep;
+		if (fadeStep !== null) {
+			const color = this.config.fadeColors[Math.min(fadeStep, this.config.fadeColors.length - 1)];
+			if (color !== undefined) painted = applyFade(painted, color);
+		}
+
+		const label = this.toastLabel;
+		if (label !== null) {
+			const composite = tui.compositeLineAt?.bind(tui) ?? compositeLineFallback;
+			painted = paintToast(painted, width, { label, measure: this.deps.measure, composite });
+		}
+
+		return painted;
 	}
 
 	private onSelectionCopied(text: string, tui: TuiLike, hooks: TuiHooks): void {
@@ -305,27 +327,64 @@ export class CopyOnSelectRuntime {
 			});
 		}
 		if (this.config.toast) this.showToast(tui);
-		this.scheduleClear(() => this.clearHighlight(tui, hooks));
+		this.scheduleClear(tui, hooks);
 	}
 
-	private scheduleClear(run: () => void): void {
-		if (this.pendingClear) this.clearTimer(this.pendingClear);
-		this.pendingClear = null;
+	private scheduleClear(tui: TuiLike, hooks: TuiHooks): void {
+		this.cancelClearTimers();
 
-		if (this.config.clearSelection === "keep") return;
-		if (this.config.clearSelection === "immediate" || this.config.delayMs === 0) {
-			run();
+		const mode = this.config.clearSelection;
+		if (mode === "keep") return;
+
+		if (mode === "fade") {
+			if (this.config.fadeColors.length > 0) {
+				this.startFade(tui, hooks);
+			} else {
+				this.clearHighlight(tui, hooks);
+			}
+			return;
+		}
+
+		if (mode === "immediate" || this.config.delayMs === 0) {
+			this.clearHighlight(tui, hooks);
 			return;
 		}
 
 		this.pendingClear = this.setTimer(() => {
 			this.pendingClear = null;
-			run();
+			this.clearHighlight(tui, hooks);
 		}, this.config.delayMs);
+	}
+
+	/** Steps the selection down the colour ramp, then drops it. */
+	private startFade(tui: TuiLike, hooks: TuiHooks): void {
+		const colors = this.config.fadeColors;
+		const stepMs = fadeStepMs(this.config.fadeMs, colors.length);
+
+		this.fadeStep = 0;
+		tui.requestRender?.();
+
+		const advance = (): void => {
+			const next = (this.fadeStep ?? 0) + 1;
+			if (next >= colors.length) {
+				this.pendingFade = null;
+				this.fadeStep = null;
+				this.clearHighlight(tui, hooks);
+				tui.requestRender?.();
+				return;
+			}
+
+			this.fadeStep = next;
+			tui.requestRender?.();
+			this.pendingFade = this.setTimer(advance, stepMs);
+		};
+
+		this.pendingFade = this.setTimer(advance, stepMs);
 	}
 
 	/** Replays a zero-width click so the editor that owns the highlight drops it. */
 	private clearHighlight(tui: TuiLike, hooks: TuiHooks): void {
+		this.fadeStep = null;
 		if (!ownsMouseReporting(tui) || hasVisibleOverlay(tui)) return;
 
 		hooks.replaying = true;
@@ -361,10 +420,16 @@ export class CopyOnSelectRuntime {
 		this.tui?.requestRender?.();
 	}
 
-	private cancelTimers(): void {
+	private cancelClearTimers(): void {
 		if (this.pendingClear) this.clearTimer(this.pendingClear);
-		if (this.pendingToast) this.clearTimer(this.pendingToast);
+		if (this.pendingFade) this.clearTimer(this.pendingFade);
 		this.pendingClear = null;
+		this.pendingFade = null;
+	}
+
+	private cancelTimers(): void {
+		this.cancelClearTimers();
+		if (this.pendingToast) this.clearTimer(this.pendingToast);
 		this.pendingToast = null;
 	}
 }

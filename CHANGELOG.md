@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.4.0
+
+- `clearSelection: "fade"` now performs a real fade instead of a plain linger. Each
+  frame's reverse-video selection is rewritten to an explicit background colour that
+  steps down a configurable xterm-256 ramp (`fadeColors`) over `fadeMs`, and the
+  selection is dropped after the final step. `fade` is the new default.
+- `delayed` remains available for a fully lit linger, and `fadeMs`/`delayMs` are now
+  separate settings.
+- `/copy-on-select clear fade` and fade progress in `/copy-on-select status`.
+
 ## 0.3.0
 
 - Fixed the extension going inert after `/reload`. Hooks are now registered on the

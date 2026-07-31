@@ -11,14 +11,16 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { DEFAULT_FADE_COLORS, normalizeFadeColors } from "./fade.ts";
 
 /**
  * What happens to the highlight after a copy.
  * - `immediate`: drop it as soon as the mouse is released
- * - `delayed`: leave it up for `delayMs`, then drop it
+ * - `fade`: dim it down a colour ramp over `fadeMs`, then drop it
+ * - `delayed`: leave it fully lit for `delayMs`, then drop it
  * - `keep`: never drop it; the owning editor decides
  */
-export type ClearSelectionMode = "immediate" | "delayed" | "keep";
+export type ClearSelectionMode = "immediate" | "fade" | "delayed" | "keep";
 
 export interface CopyOnSelectConfig {
 	/** Master switch for all behavior. */
@@ -29,6 +31,10 @@ export interface CopyOnSelectConfig {
 	clearSelection: ClearSelectionMode;
 	/** Linger time before dropping the highlight when `clearSelection` is `"delayed"`. */
 	delayMs: number;
+	/** Fade duration when `clearSelection` is `"fade"`. */
+	fadeMs: number;
+	/** xterm-256 colour indexes the fade steps through. */
+	fadeColors: number[];
 	/** Show a bottom-right toast after a copy. */
 	toast: boolean;
 	/** Toast message text. */
@@ -40,8 +46,10 @@ export interface CopyOnSelectConfig {
 export const DEFAULT_CONFIG: CopyOnSelectConfig = {
 	enabled: true,
 	copy: true,
-	clearSelection: "immediate",
+	clearSelection: "fade",
 	delayMs: 250,
+	fadeMs: 400,
+	fadeColors: [...DEFAULT_FADE_COLORS],
 	toast: true,
 	toastText: "Copied to clipboard",
 	toastMs: 1500,
@@ -50,6 +58,8 @@ export const DEFAULT_CONFIG: CopyOnSelectConfig = {
 const SETTINGS_KEY = "copyOnSelect";
 const MIN_DELAY_MS = 0;
 const MAX_DELAY_MS = 5000;
+const MIN_FADE_MS = 60;
+const MAX_FADE_MS = 5000;
 const MIN_TOAST_MS = 200;
 const MAX_TOAST_MS = 10000;
 
@@ -66,12 +76,11 @@ function clampedInteger(value: unknown, fallback: number, min: number, max: numb
 	return Math.min(max, Math.max(min, Math.round(value)));
 }
 
-/** Accepts the current modes plus the pre-0.2 `fade`/`off`/boolean spellings. */
+/** Accepts the current modes plus the `off`/boolean spellings. */
 function clearSelectionMode(value: unknown, fallback: ClearSelectionMode): ClearSelectionMode {
 	if (value === true) return "immediate";
 	if (value === false || value === "off" || value === "never" || value === "keep") return "keep";
-	if (value === "fade" || value === "delayed") return "delayed";
-	if (value === "immediate") return "immediate";
+	if (value === "immediate" || value === "fade" || value === "delayed") return value;
 	return fallback;
 }
 
@@ -85,14 +94,13 @@ export function normalizeConfig(raw: unknown, base: CopyOnSelectConfig = DEFAULT
 	if (raw === true || raw === undefined || raw === null) return { ...base };
 	if (!isRecord(raw)) return { ...base };
 
-	// `fadeMs` is the pre-0.2 name for `delayMs`.
-	const delay = raw.delayMs ?? raw.fadeMs;
-
 	return {
 		enabled: boolean(raw.enabled, base.enabled),
 		copy: boolean(raw.copy, base.copy),
 		clearSelection: clearSelectionMode(raw.clearSelection, base.clearSelection),
-		delayMs: clampedInteger(delay, base.delayMs, MIN_DELAY_MS, MAX_DELAY_MS),
+		delayMs: clampedInteger(raw.delayMs, base.delayMs, MIN_DELAY_MS, MAX_DELAY_MS),
+		fadeMs: clampedInteger(raw.fadeMs, base.fadeMs, MIN_FADE_MS, MAX_FADE_MS),
+		fadeColors: raw.fadeColors === undefined ? [...base.fadeColors] : normalizeFadeColors(raw.fadeColors),
 		toast: boolean(raw.toast, base.toast),
 		toastText: nonEmptyString(raw.toastText, base.toastText),
 		toastMs: clampedInteger(raw.toastMs, base.toastMs, MIN_TOAST_MS, MAX_TOAST_MS),
@@ -135,7 +143,11 @@ export function readConfig(options: ReadConfigOptions): CopyOnSelectConfig {
 }
 
 export function describeConfig(config: CopyOnSelectConfig): string {
-	const clear = config.clearSelection === "delayed" ? `delayed (${config.delayMs}ms)` : config.clearSelection;
+	const clear = config.clearSelection === "delayed"
+		? `delayed (${config.delayMs}ms)`
+		: config.clearSelection === "fade"
+			? `fade (${config.fadeMs}ms, ${config.fadeColors.length} steps)`
+			: config.clearSelection;
 
 	return [
 		`copy-on-select ${config.enabled ? "on" : "off"}`,

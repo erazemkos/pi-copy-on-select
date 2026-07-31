@@ -68,7 +68,13 @@ class FakeTui implements TuiLike {
 	}
 
 	render(_width: number): string[] {
-		return [...this.compositor.lines];
+		const selection = this.compositor.selection;
+		return this.compositor.lines.map((line, index) => {
+			if (!selection) return line;
+			const row = index + 1;
+			const [top, bottom] = [selection.anchor.row, selection.focus.row].sort((a, b) => a - b);
+			return row >= top && row <= bottom ? `\x1b[7m${line}\x1b[27m` : line;
+		});
 	}
 
 	requestRender(): void {
@@ -116,14 +122,26 @@ class Clock {
 		this.timers.delete(handle as number);
 	};
 
+	/** Discrete-event advance: fires due timers in order, moving `now` to each. */
 	advance(ms: number): void {
-		this.now += ms;
-		for (const [id, timer] of [...this.timers]) {
-			if (timer.dueAt <= this.now) {
-				this.timers.delete(id);
-				timer.callback();
+		const target = this.now + ms;
+
+		for (let guard = 0; guard < 1000; guard++) {
+			const next = [...this.timers]
+				.filter(([, timer]) => timer.dueAt <= target)
+				.sort((a, b) => a[1].dueAt - b[1].dueAt)[0];
+			if (!next) {
+				this.now = target;
+				return;
 			}
+
+			const [id, timer] = next;
+			this.timers.delete(id);
+			this.now = Math.max(this.now, timer.dueAt);
+			timer.callback();
 		}
+
+		throw new Error("timer cascade did not settle");
 	}
 
 	get pending(): number {
@@ -181,8 +199,8 @@ function harness(overrides: Partial<CopyOnSelectConfig> = {}, options: { ownsMou
 	return { runtime, tui, session, clock, clipboard, drag, frame, toastRow };
 }
 
-test("drag selection is copied, announced, and cleared immediately by default", () => {
-	const h = harness();
+test("drag selection is copied, announced, and cleared immediately", () => {
+	const h = harness({ clearSelection: "immediate" });
 
 	h.drag(1, 1, 6, 1);
 
@@ -202,7 +220,7 @@ test("drag selection is copied, announced, and cleared immediately by default", 
 });
 
 test("multi-row selection keeps line breaks", () => {
-	const h = harness();
+	const h = harness({ clearSelection: "immediate" });
 
 	h.drag(7, 1, 7, 3);
 
@@ -238,7 +256,7 @@ test("keep mode leaves the highlight for manual copying", () => {
 });
 
 test("toast can be disabled while copying stays on", () => {
-	const h = harness({ toast: false });
+	const h = harness({ toast: false, clearSelection: "immediate" });
 
 	h.drag(1, 1, 6, 1);
 
@@ -248,7 +266,7 @@ test("toast can be disabled while copying stays on", () => {
 });
 
 test("copy can be disabled while the highlight still clears", () => {
-	const h = harness({ copy: false });
+	const h = harness({ copy: false, clearSelection: "immediate" });
 
 	h.drag(1, 1, 6, 1);
 
@@ -312,7 +330,7 @@ test("selection is dropped when the viewport changes mid-drag", () => {
 });
 
 test("installing twice does not double-handle input", () => {
-	const h = harness();
+	const h = harness({ clearSelection: "immediate" });
 	h.runtime.install(h.tui);
 
 	h.drag(1, 1, 6, 1);
@@ -354,7 +372,7 @@ test("a reloaded runtime takes over the hooks from the previous one", () => {
 });
 
 test("a torn down and rebuilt editor render hook is re-asserted", () => {
-	const h = harness();
+	const h = harness({ clearSelection: "immediate" });
 	const piRender = (_width: number): string[] => h.tui.compositor.lines;
 
 	// Mirrors pi-powerline-footer reinstalling its compositor: it restores the render
@@ -367,6 +385,59 @@ test("a torn down and rebuilt editor render hook is re-asserted", () => {
 
 	assert.notEqual(h.tui.render, editorRender, "our wrapper is outermost again");
 	assert.deepEqual(h.clipboard, ["first"], "selection handling recovers");
+});
+
+test("fade dims the selection down the ramp and then drops it", () => {
+	const h = harness({ clearSelection: "fade", fadeMs: 400, fadeColors: [252, 244, 236] });
+
+	h.drag(1, 1, 6, 1);
+
+	const shade = (): string | undefined => h.frame().find((line) => line.includes("\x1b[48;5;"));
+	assert.match(shade() ?? "", /\x1b\[48;5;252m/, "first ramp step is painted immediately");
+	assert.ok(h.tui.compositor.selection, "selection is still held by the editor");
+
+	h.clock.advance(134);
+	assert.match(shade() ?? "", /\x1b\[48;5;244m/);
+
+	h.clock.advance(134);
+	assert.match(shade() ?? "", /\x1b\[48;5;236m/);
+
+	h.clock.advance(134);
+	assert.equal(h.tui.compositor.selection, null, "selection is dropped after the last step");
+	assert.equal(shade(), undefined, "no shading remains");
+	assert.deepEqual(h.clipboard, ["first"], "the copy happened once, up front");
+});
+
+test("fade reverts to reverse video handling when the ramp is empty", () => {
+	const h = harness({ clearSelection: "fade", fadeColors: [] });
+
+	h.drag(1, 1, 6, 1);
+
+	assert.equal(h.tui.compositor.selection, null, "empty ramp clears immediately");
+});
+
+test("a new selection restarts the fade instead of stacking timers", () => {
+	const h = harness({ clearSelection: "fade", fadeMs: 400, fadeColors: [252, 244, 236] });
+
+	h.drag(1, 1, 6, 1);
+	h.clock.advance(134);
+	h.drag(1, 2, 7, 2);
+
+	assert.equal(h.clock.pending, 2, "one fade timer and one toast timer");
+	assert.match(h.frame().find((line) => line.includes("\x1b[48;5;")) ?? "", /\x1b\[48;5;252m/, "ramp restarts");
+
+	h.clock.advance(400);
+	assert.equal(h.tui.compositor.selection, null);
+});
+
+test("status reports fade progress", () => {
+	const h = harness({ clearSelection: "fade", fadeMs: 400, fadeColors: [252, 244, 236] });
+
+	h.drag(1, 1, 6, 1);
+
+	assert.match(h.runtime.handleCommand("status", h.session).message, /fade step 1\/3/);
+	h.clock.advance(400);
+	assert.match(h.runtime.handleCommand("status", h.session).message, /fade idle/);
 });
 
 test("status reports hook and mouse ownership", () => {
@@ -382,7 +453,7 @@ test("status reports hook and mouse ownership", () => {
 });
 
 test("command toggles behavior and reports status", () => {
-	const h = harness();
+	const h = harness({ clearSelection: "immediate" });
 
 	assert.match(h.runtime.handleCommand("", h.session).message, /copy-on-select on/);
 
@@ -406,11 +477,12 @@ test("command toggles behavior and reports status", () => {
 	assert.match(unknown.message, /Unknown argument/);
 
 	h.runtime.handleCommand("reload", h.session);
-	assert.deepEqual(h.runtime.getConfig(), DEFAULT_CONFIG, "reload restores settings from disk");
+	assert.equal(h.runtime.getConfig().clearSelection, "immediate", "reload restores settings from disk");
+	assert.equal(h.runtime.getConfig().toast, DEFAULT_CONFIG.toast);
 });
 
 test("turning the toast off hides one that is already showing", () => {
-	const h = harness();
+	const h = harness({ clearSelection: "immediate" });
 
 	h.drag(1, 1, 6, 1);
 	assert.ok(h.toastRow());
