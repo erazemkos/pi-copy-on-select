@@ -13,7 +13,7 @@
  */
 
 import { CONFIG_DIR_NAME, copyToClipboard, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { visibleWidth } from "@earendil-works/pi-tui";
 import { readConfig } from "./config.ts";
 import { CopyOnSelectRuntime, type SessionLike } from "./runtime.ts";
 
@@ -23,15 +23,14 @@ const COMMAND_ARGUMENTS = [
 	"toast on",
 	"toast off",
 	"clear immediate",
-	"clear fade",
-	"clear off",
+	"clear delayed",
+	"clear keep",
 	"reload",
 ];
 
 export default function (pi: ExtensionAPI) {
 	const runtime = new CopyOnSelectRuntime({
 		measure: visibleWidth,
-		truncate: (text, width) => truncateToWidth(text, width, ""),
 		copyToClipboard,
 		readConfig: (cwd) => readConfig({ cwd, configDirName: CONFIG_DIR_NAME }),
 	});

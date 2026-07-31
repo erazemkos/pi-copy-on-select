@@ -12,17 +12,23 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
-export type ClearSelectionMode = "immediate" | "fade" | "off";
+/**
+ * What happens to the highlight after a copy.
+ * - `immediate`: drop it as soon as the mouse is released
+ * - `delayed`: leave it up for `delayMs`, then drop it
+ * - `keep`: never drop it; the owning editor decides
+ */
+export type ClearSelectionMode = "immediate" | "delayed" | "keep";
 
 export interface CopyOnSelectConfig {
 	/** Master switch for all behavior. */
 	enabled: boolean;
 	/** Copy the selection to the system clipboard on mouse release. */
 	copy: boolean;
-	/** What happens to the highlight after a copy. */
+	/** When to drop the highlight after a copy. */
 	clearSelection: ClearSelectionMode;
-	/** How long the highlight lingers before clearing when `clearSelection` is `"fade"`. */
-	fadeMs: number;
+	/** Linger time before dropping the highlight when `clearSelection` is `"delayed"`. */
+	delayMs: number;
 	/** Show a bottom-right toast after a copy. */
 	toast: boolean;
 	/** Toast message text. */
@@ -34,16 +40,16 @@ export interface CopyOnSelectConfig {
 export const DEFAULT_CONFIG: CopyOnSelectConfig = {
 	enabled: true,
 	copy: true,
-	clearSelection: "fade",
-	fadeMs: 250,
+	clearSelection: "immediate",
+	delayMs: 250,
 	toast: true,
 	toastText: "Copied to clipboard",
 	toastMs: 1500,
 };
 
 const SETTINGS_KEY = "copyOnSelect";
-const MIN_FADE_MS = 0;
-const MAX_FADE_MS = 5000;
+const MIN_DELAY_MS = 0;
+const MAX_DELAY_MS = 5000;
 const MIN_TOAST_MS = 200;
 const MAX_TOAST_MS = 10000;
 
@@ -60,10 +66,12 @@ function clampedInteger(value: unknown, fallback: number, min: number, max: numb
 	return Math.min(max, Math.max(min, Math.round(value)));
 }
 
+/** Accepts the current modes plus the pre-0.2 `fade`/`off`/boolean spellings. */
 function clearSelectionMode(value: unknown, fallback: ClearSelectionMode): ClearSelectionMode {
-	if (value === false) return "off";
 	if (value === true) return "immediate";
-	if (value === "immediate" || value === "fade" || value === "off") return value;
+	if (value === false || value === "off" || value === "never" || value === "keep") return "keep";
+	if (value === "fade" || value === "delayed") return "delayed";
+	if (value === "immediate") return "immediate";
 	return fallback;
 }
 
@@ -77,11 +85,14 @@ export function normalizeConfig(raw: unknown, base: CopyOnSelectConfig = DEFAULT
 	if (raw === true || raw === undefined || raw === null) return { ...base };
 	if (!isRecord(raw)) return { ...base };
 
+	// `fadeMs` is the pre-0.2 name for `delayMs`.
+	const delay = raw.delayMs ?? raw.fadeMs;
+
 	return {
 		enabled: boolean(raw.enabled, base.enabled),
 		copy: boolean(raw.copy, base.copy),
 		clearSelection: clearSelectionMode(raw.clearSelection, base.clearSelection),
-		fadeMs: clampedInteger(raw.fadeMs, base.fadeMs, MIN_FADE_MS, MAX_FADE_MS),
+		delayMs: clampedInteger(delay, base.delayMs, MIN_DELAY_MS, MAX_DELAY_MS),
 		toast: boolean(raw.toast, base.toast),
 		toastText: nonEmptyString(raw.toastText, base.toastText),
 		toastMs: clampedInteger(raw.toastMs, base.toastMs, MIN_TOAST_MS, MAX_TOAST_MS),
@@ -124,12 +135,12 @@ export function readConfig(options: ReadConfigOptions): CopyOnSelectConfig {
 }
 
 export function describeConfig(config: CopyOnSelectConfig): string {
-	const parts = [
+	const clear = config.clearSelection === "delayed" ? `delayed (${config.delayMs}ms)` : config.clearSelection;
+
+	return [
 		`copy-on-select ${config.enabled ? "on" : "off"}`,
 		`copy ${config.copy ? "on" : "off"}`,
-		`clear ${config.clearSelection}${config.clearSelection === "fade" ? ` (${config.fadeMs}ms)` : ""}`,
+		`clear ${clear}`,
 		`toast ${config.toast ? `on (${config.toastMs}ms)` : "off"}`,
-	];
-
-	return parts.join(" · ");
+	].join(" · ");
 }

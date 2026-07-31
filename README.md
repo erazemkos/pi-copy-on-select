@@ -5,8 +5,8 @@ Copy-on-select for the [pi coding agent](https://github.com/earendil-works/pi-mo
 ## Features
 
 - **Copy on select** — mouse selections are copied on release, no `ctrl+c` needed. Double-click copies a whole line.
-- **Self-clearing highlight** — the selection disappears after the copy: instantly, after a short linger (`fade`), or never.
-- **Bottom-right toast** — a one-line "Copied to clipboard" confirmation that fades on its own. Fully optional.
+- **Self-clearing highlight** — the selection disappears right after the copy, or after a delay you choose, or not at all.
+- **Bottom-right toast** — a "Copied to clipboard" confirmation painted into the bottom-right corner. It reuses the last viewport row instead of adding one, so nothing on screen shifts. Fully optional.
 - **Independent clipboard handling** — selections are reconstructed from raw mouse reports and read off the rendered viewport, so copying does not rely on any other extension's clipboard feature.
 - **Runtime toggles** — `/copy-on-select` flips behavior for the current session without editing settings.
 
@@ -49,8 +49,8 @@ All settings live under `copyOnSelect` in `~/.pi/agent/settings.json` (global) o
   "copyOnSelect": {
     "enabled": true,
     "copy": true,
-    "clearSelection": "fade",
-    "fadeMs": 250,
+    "clearSelection": "immediate",
+    "delayMs": 250,
     "toast": true,
     "toastText": "Copied to clipboard",
     "toastMs": 1500
@@ -62,11 +62,19 @@ All settings live under `copyOnSelect` in `~/.pi/agent/settings.json` (global) o
 |---|---|---|---|
 | `enabled` | boolean | `true` | Master switch. `"copyOnSelect": false` is accepted as shorthand. |
 | `copy` | boolean | `true` | Write the selection to the system clipboard on mouse release. |
-| `clearSelection` | `"immediate"` \| `"fade"` \| `"off"` | `"fade"` | When to drop the highlight after a copy. `true`/`false` are accepted as `"immediate"`/`"off"`. |
-| `fadeMs` | number | `250` | Linger time before clearing, used by `"fade"` (0–5000). |
+| `clearSelection` | `"immediate"` \| `"delayed"` \| `"keep"` | `"immediate"` | When to drop the highlight after a copy. |
+| `delayMs` | number | `250` | Linger time used by `"delayed"` (0–5000). `0` behaves like `"immediate"`. |
 | `toast` | boolean | `true` | Show the bottom-right confirmation. |
 | `toastText` | string | `"Copied to clipboard"` | Toast message. |
 | `toastMs` | number | `1500` | How long the toast stays visible (200–10000). |
+
+`clearSelection` modes:
+
+- `immediate` — the highlight is gone as soon as you release the mouse.
+- `delayed` — the highlight stays for `delayMs`, then disappears. This is a plain linger, not a gradual visual fade: the highlight is inverse-video painted by the editor that owns the viewport, so there is no opacity to animate.
+- `keep` — the highlight stays until you dismiss it (click elsewhere, or `ctrl+c` to copy again).
+
+Pre-0.2 spellings still work: `"fade"` maps to `"delayed"`, `fadeMs` to `delayMs`, and `"off"`/`false` to `"keep"`.
 
 ### `/copy-on-select`
 
@@ -77,7 +85,7 @@ Session-local overrides; settings files stay untouched.
 | `/copy-on-select` | Show current behavior |
 | `/copy-on-select on` \| `off` | Enable or disable everything |
 | `/copy-on-select toast on` \| `toast off` | Toggle the toast |
-| `/copy-on-select clear immediate` \| `clear fade` \| `clear off` | Change highlight clearing |
+| `/copy-on-select clear immediate` \| `clear delayed` \| `clear keep` | Change highlight clearing |
 | `/copy-on-select reload` | Re-read settings from disk |
 
 ## How it works
@@ -86,6 +94,7 @@ Session-local overrides; settings files stay untouched.
 2. It wraps the TUI's render function to keep a snapshot of the visible chat lines, including selection styling.
 3. On release it maps screen coordinates onto that snapshot, slices the selected columns (grapheme- and wide-character aware), strips ANSI, and copies the text.
 4. The highlight is dropped by replaying a zero-width click, which the owning editor reads as "clicked without selecting".
+5. The toast is composited onto the tail of an existing bottom row (using pi-tui's `compositeLineAt`), preferring a row whose right side is blank. Nothing is added to the layout, so no content moves and no overlay is created — visible overlays would make the owning editor release mouse ownership.
 
 Safety rails:
 

@@ -1,34 +1,79 @@
 /**
- * Bottom-right toast rendering.
+ * Bottom-right toast painting.
  *
- * The toast is a below-editor widget rather than a TUI overlay: visible overlays
- * make terminal-splitting editors (for example pi-powerline-footer's fixed
- * editor) release mouse ownership, which would break selection and scrolling
- * while the toast is on screen.
+ * The toast is composited onto the tail of an already rendered viewport line
+ * instead of occupying its own row. That keeps the layout perfectly stable (no
+ * content shifting up and back down) and avoids TUI overlays, which make
+ * terminal-splitting editors release mouse ownership while they are visible.
  */
 
-export interface ToastStyle {
-	icon: (text: string) => string;
-	text: (text: string) => string;
-}
-
-export interface ToastMetrics {
+export interface ToastPaintOptions {
+	/** Pre-styled toast content, e.g. `"✓ Copied to clipboard"`. */
+	label: string;
+	/** Visible width of a string, ignoring ANSI escapes. */
 	measure: (text: string) => number;
-	truncate: (text: string, width: number) => string;
+	/** ANSI-safe line composition, mirroring pi-tui's `compositeLineAt`. */
+	composite: (baseLine: string, overlayLine: string, startCol: number, overlayWidth: number, totalWidth: number) => string;
+	/** Columns kept free at the right edge. */
+	marginRight?: number;
+	/** How many bottom rows may be inspected for a blank tail. */
+	searchRows?: number;
 }
 
-const MIN_TOAST_WIDTH = 6;
+const DEFAULT_MARGIN_RIGHT = 1;
+const DEFAULT_SEARCH_ROWS = 3;
+const ANSI_PATTERN = /\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 
-/** Renders a single right-aligned toast line that fits `width` columns. */
-export function renderToastLine(message: string, width: number, style: ToastStyle, metrics: ToastMetrics): string[] {
-	if (width < MIN_TOAST_WIDTH || message.trim().length === 0) return [];
+function stripAnsi(line: string): string {
+	return line.replace(ANSI_PATTERN, "");
+}
 
-	const plain = ` ✓ ${message} `;
-	const visible = metrics.measure(plain);
-	if (visible > width) {
-		return [style.text(metrics.truncate(plain, width))];
+/** True when columns `[startCol, endCol)` of `line` contain nothing but blanks. */
+function tailIsBlank(line: string, startCol: number, endCol: number): boolean {
+	const plain = stripAnsi(line);
+	return plain.slice(startCol, endCol).trim().length === 0 && plain.length <= endCol;
+}
+
+/**
+ * Returns a copy of `lines` with the toast painted into the bottom-right corner,
+ * or the original array when it does not fit.
+ */
+export function paintToast(lines: readonly string[], width: number, options: ToastPaintOptions): string[] {
+	const marginRight = options.marginRight ?? DEFAULT_MARGIN_RIGHT;
+	const searchRows = options.searchRows ?? DEFAULT_SEARCH_ROWS;
+	const labelWidth = options.measure(stripAnsi(options.label));
+
+	if (lines.length === 0 || labelWidth === 0) return [...lines];
+	if (labelWidth + marginRight >= width) return [...lines];
+
+	const startCol = width - labelWidth - marginRight;
+	const endCol = startCol + labelWidth;
+
+	// Prefer a bottom row whose tail is empty so nothing readable gets covered.
+	let target = lines.length - 1;
+	for (let offset = 0; offset < Math.min(searchRows, lines.length); offset++) {
+		const index = lines.length - 1 - offset;
+		if (tailIsBlank(lines[index] ?? "", startCol, endCol)) {
+			target = index;
+			break;
+		}
 	}
 
-	const padding = " ".repeat(width - visible);
-	return [`${padding} ${style.icon("✓")} ${style.text(message)} `];
+	const painted = [...lines];
+	painted[target] = options.composite(painted[target] ?? "", options.label, startCol, labelWidth, width);
+	return painted;
+}
+
+/** Fallback composition for TUIs without `compositeLineAt`; drops base styling. */
+export function compositeLineFallback(
+	baseLine: string,
+	overlayLine: string,
+	startCol: number,
+	overlayWidth: number,
+	totalWidth: number,
+): string {
+	const plain = stripAnsi(baseLine);
+	const before = plain.slice(0, startCol).padEnd(startCol, " ");
+	const after = plain.slice(startCol + overlayWidth, totalWidth);
+	return `${before}${overlayLine}${after}`;
 }

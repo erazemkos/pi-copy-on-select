@@ -8,10 +8,9 @@
 
 import { type ClearSelectionMode, type CopyOnSelectConfig, DEFAULT_CONFIG, describeConfig } from "./config.ts";
 import { parseSgrMousePackets, SelectionTracker } from "./selection.ts";
-import { renderToastLine } from "./toast.ts";
+import { compositeLineFallback, paintToast } from "./toast.ts";
 
 const CAPTURE_WIDGET_KEY = "copy-on-select-capture";
-const TOAST_WIDGET_KEY = "copy-on-select-toast";
 const INSTALL_FLAG = "__piCopyOnSelectInstalled";
 /** Column 2 keeps the synthetic click inside the content area for any output padding. */
 const SYNTHETIC_CLICK_COL = 2;
@@ -26,7 +25,9 @@ export interface TerminalLike {
 export interface TuiLike {
 	handleInput(data: string): void;
 	render?(width: number): string[];
+	requestRender?(): void;
 	hasOverlay?(): boolean;
+	compositeLineAt?(baseLine: string, overlayLine: string, startCol: number, overlayWidth: number, totalWidth: number): string;
 	terminal?: TerminalLike;
 }
 
@@ -44,6 +45,7 @@ export type WidgetFactory = (tui: unknown, theme: ThemeLike) => WidgetComponent;
 export interface SessionUi {
 	setWidget(key: string, content: WidgetFactory | undefined, options?: { placement?: "aboveEditor" | "belowEditor" }): void;
 	notify(message: string, level?: "info" | "warning" | "error"): void;
+	readonly theme?: ThemeLike;
 }
 
 export interface SessionLike {
@@ -53,10 +55,8 @@ export interface SessionLike {
 }
 
 export interface RuntimeDeps {
-	/** Visible width of an ANSI-free string. */
+	/** Visible width of a string, ignoring ANSI escapes. */
 	measure: (text: string) => number;
-	/** Truncate to a visible width without adding an ellipsis. */
-	truncate: (text: string, width: number) => string;
 	copyToClipboard: (text: string) => Promise<void>;
 	readConfig: (cwd: string) => CopyOnSelectConfig;
 	setTimer?: (callback: () => void, ms: number) => unknown;
@@ -90,6 +90,7 @@ export class CopyOnSelectRuntime {
 	private tui: TuiLike | null = null;
 	private viewportLines: readonly string[] = [];
 	private renderWrapper: ((width: number) => string[]) | null = null;
+	private toastLabel: string | null = null;
 	private pendingClear: unknown = null;
 	private pendingToast: unknown = null;
 
@@ -142,13 +143,13 @@ export class CopyOnSelectRuntime {
 		} else if (command === "toast on" || command === "toast off") {
 			this.config = { ...this.config, toast: command === "toast on" };
 			if (!this.config.toast) this.hideToast();
-		} else if (command === "clear immediate" || command === "clear fade" || command === "clear off") {
+		} else if (command === "clear immediate" || command === "clear delayed" || command === "clear keep") {
 			this.config = { ...this.config, clearSelection: command.slice("clear ".length) as ClearSelectionMode };
 		} else if (command === "reload") {
 			this.config = this.deps.readConfig(session.cwd);
 		} else if (command.length > 0) {
 			return {
-				message: `Unknown argument: ${command}. Use on|off|toast on|toast off|clear immediate|clear fade|clear off|reload`,
+				message: `Unknown argument: ${command}. Use on|off|toast on|toast off|clear immediate|clear delayed|clear keep|reload`,
 				level: "warning",
 			};
 		}
@@ -206,7 +207,10 @@ export class CopyOnSelectRuntime {
 		};
 	}
 
-	/** Captures what the viewport currently shows, including selection styling. */
+	/**
+	 * Captures what the viewport currently shows (for selection text) and paints the
+	 * toast into the bottom-right corner of the same frame.
+	 */
 	private wrapRender(tui: TuiLike): void {
 		const currentRender = tui.render;
 		if (typeof currentRender !== "function" || currentRender === this.renderWrapper) return;
@@ -215,7 +219,12 @@ export class CopyOnSelectRuntime {
 		this.renderWrapper = (width: number): string[] => {
 			const lines = originalRender(width);
 			this.viewportLines = lines;
-			return lines;
+
+			const label = this.toastLabel;
+			if (label === null) return lines;
+
+			const composite = tui.compositeLineAt?.bind(tui) ?? compositeLineFallback;
+			return paintToast(lines, width, { label, measure: this.deps.measure, composite });
 		};
 		tui.render = this.renderWrapper;
 	}
@@ -226,7 +235,7 @@ export class CopyOnSelectRuntime {
 				/* Clipboard tooling can be unavailable; the highlight still clears. */
 			});
 		}
-		if (this.config.toast) this.showToast();
+		if (this.config.toast) this.showToast(tui);
 		this.scheduleClear(() => this.clearHighlight(tui, replay));
 	}
 
@@ -234,8 +243,8 @@ export class CopyOnSelectRuntime {
 		if (this.pendingClear) this.clearTimer(this.pendingClear);
 		this.pendingClear = null;
 
-		if (this.config.clearSelection === "off") return;
-		if (this.config.clearSelection === "immediate") {
+		if (this.config.clearSelection === "keep") return;
+		if (this.config.clearSelection === "immediate" || this.config.delayMs === 0) {
 			run();
 			return;
 		}
@@ -243,7 +252,7 @@ export class CopyOnSelectRuntime {
 		this.pendingClear = this.setTimer(() => {
 			this.pendingClear = null;
 			run();
-		}, this.config.fadeMs);
+		}, this.config.delayMs);
 	}
 
 	/** Replays a zero-width click so the editor that owns the highlight drops it. */
@@ -254,29 +263,14 @@ export class CopyOnSelectRuntime {
 		replay(`\x1b[<0;${SYNTHETIC_CLICK_COL};${SYNTHETIC_CLICK_ROW}m`);
 	}
 
-	private showToast(): void {
+	private showToast(tui: TuiLike): void {
 		if (this.pendingToast) this.clearTimer(this.pendingToast);
-		this.pendingToast = null;
 
-		const message = this.config.toastText;
-		const { measure, truncate } = this.deps;
-
-		this.withSession((session) => {
-			session.ui.setWidget(
-				TOAST_WIDGET_KEY,
-				(_tui, theme) => ({
-					render: (width: number) =>
-						renderToastLine(
-							message,
-							width,
-							{ icon: (text) => theme.fg("success", text), text: (value) => theme.fg("muted", value) },
-							{ measure, truncate },
-						),
-					invalidate: () => {},
-				}),
-				{ placement: "belowEditor" },
-			);
-		});
+		const theme = this.session?.ui.theme;
+		const icon = theme ? theme.fg("success", "✓") : "✓";
+		const text = theme ? theme.fg("muted", this.config.toastText) : this.config.toastText;
+		this.toastLabel = `${icon} ${text}`;
+		tui.requestRender?.();
 
 		this.pendingToast = this.setTimer(() => {
 			this.pendingToast = null;
@@ -287,7 +281,10 @@ export class CopyOnSelectRuntime {
 	private hideToast(): void {
 		if (this.pendingToast) this.clearTimer(this.pendingToast);
 		this.pendingToast = null;
-		this.withSession((session) => session.ui.setWidget(TOAST_WIDGET_KEY, undefined));
+		if (this.toastLabel === null) return;
+
+		this.toastLabel = null;
+		this.tui?.requestRender?.();
 	}
 
 	private cancelTimers(): void {
@@ -295,17 +292,5 @@ export class CopyOnSelectRuntime {
 		if (this.pendingToast) this.clearTimer(this.pendingToast);
 		this.pendingClear = null;
 		this.pendingToast = null;
-	}
-
-	private withSession(action: (session: SessionLike) => void): void {
-		const session = this.session;
-		if (!session) return;
-
-		try {
-			action(session);
-		} catch {
-			// The session context can go stale between a copy and its follow-up UI work.
-			this.session = null;
-		}
 	}
 }
