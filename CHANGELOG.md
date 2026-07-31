@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.5.0
+
+- Fixed the toast breaking message boxes. Boxes pad themselves with
+  background-filled blank rows, and the toast used the bottom row as a fallback
+  when no blank row was found, replacing part of that padding with unstyled text
+  and splitting the box. Only genuinely empty, unstyled rows are used now, and the
+  toast is skipped when there is none.
+- Fixed fading inside a message box. Ending a faded span emitted a plain
+  background reset, dropping the box background for the rest of the row. The
+  rewrite is now background-aware and restores whatever background was active.
+
 ## 0.4.0
 
 - `clearSelection: "fade"` now performs a real fade instead of a plain linger. Each

@@ -10,41 +10,55 @@ function paint(lines: string[], width: number): string[] {
 	return paintToast(lines, width, { label, measure, composite });
 }
 
-test("toast lands in the bottom-right corner of the last row", () => {
-	const painted = paint(["first row", "last row"], 20);
+test("toast lands in the bottom-right corner of a blank row", () => {
+	const painted = paint(["first row", ""], 20);
 
 	assert.equal(painted[0], "first row", "untouched rows stay identical");
-	assert.equal(painted[1], "last row           ".slice(0, 11) + label + " ".repeat(0), "toast is right-aligned");
 	assert.equal(measure(painted[1] ?? ""), 19, "one column stays free at the right edge");
+	assert.match(painted[1] ?? "", /\* Copied$/);
 });
 
-test("toast prefers a row whose tail is blank", () => {
-	const painted = paint(["short", "this bottom row is completely full of text here"], 30);
+test("toast skips rows with visible text", () => {
+	const painted = paint(["", "bottom row has text"], 30);
 
-	assert.match(painted[0] ?? "", /\* Copied$/, "blank-tailed row is used");
-	assert.equal(painted[1], "this bottom row is completely full of text here", "busy row is left alone");
+	assert.match(painted[0] ?? "", /\* Copied$/, "the blank row above is used");
+	assert.equal(painted[1], "bottom row has text");
 });
 
-test("toast falls back to the last row when no tail is blank", () => {
-	const long = "x".repeat(40);
-	const painted = paint([long, long, long, long], 30);
+test("toast never writes into a background-padded box row", () => {
+	// A user-message box pads itself with background-filled blank rows; writing
+	// into one of those punches a hole in the box.
+	const boxPadding = `\x1b[48;2;40;40;40m${" ".repeat(30)}\x1b[49m`;
+	const lines = ["text above", boxPadding, boxPadding];
 
-	assert.match(painted[3] ?? "", /\* Copied/, "last row is used as a fallback");
-	assert.equal(painted[0], long);
+	assert.deepEqual(paint(lines, 30), lines, "frame is left untouched");
+});
+
+test("toast tolerates rows that only carry reset escapes", () => {
+	const painted = paint(["text", "\x1b[0m"], 24);
+
+	assert.match(painted[1] ?? "", /\* Copied$/);
 });
 
 test("toast is skipped when it cannot fit or there is nothing to paint on", () => {
 	assert.deepEqual(paint([], 40), []);
-	assert.deepEqual(paint(["row"], 8), ["row"], "narrow viewport keeps the frame untouched");
-	assert.deepEqual(paintToast(["row"], 40, { label: "", measure, composite }), ["row"]);
+	assert.deepEqual(paint([""], 8), [""], "narrow viewport keeps the frame untouched");
+	assert.deepEqual(paintToast([""], 40, { label: "", measure, composite }), [""]);
 });
 
 test("toast does not mutate the original frame", () => {
-	const lines = ["first row", "last row"];
+	const lines = ["first row", ""];
 	const painted = paint(lines, 20);
 
 	assert.notEqual(painted, lines);
-	assert.deepEqual(lines, ["first row", "last row"]);
+	assert.deepEqual(lines, ["first row", ""]);
+});
+
+test("toast only searches a few bottom rows", () => {
+	const busy = "x".repeat(40);
+	const lines = ["", busy, busy, busy, busy];
+
+	assert.deepEqual(paint(lines, 30), lines, "a blank row far above is not used");
 });
 
 test("fallback composition keeps surrounding columns and drops base styling", () => {
@@ -55,7 +69,7 @@ test("fallback composition keeps surrounding columns and drops base styling", ()
 
 test("pi-tui style composition is used when provided", () => {
 	const calls: unknown[][] = [];
-	const painted = paintToast(["row"], 20, {
+	const painted = paintToast([""], 20, {
 		label,
 		measure,
 		composite: (...args) => {

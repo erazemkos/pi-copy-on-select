@@ -116,7 +116,7 @@ Session-local overrides; settings files stay untouched.
 3. On release it maps screen coordinates onto that snapshot, slices the selected columns (grapheme- and wide-character aware), strips ANSI, and copies the text.
 4. The highlight is dropped by replaying a zero-width click, which the owning editor reads as "clicked without selecting".
 5. While fading, the reverse-video spans in each frame are rewritten to a background colour that steps down the ramp; the selection itself is dropped after the last step.
-6. The toast is composited onto the tail of an existing bottom row (using pi-tui's `compositeLineAt`), preferring a row whose right side is blank. Nothing is added to the layout, so no content moves and no overlay is created — visible overlays would make the owning editor release mouse ownership.
+6. The toast is composited onto a genuinely blank bottom row (using pi-tui's `compositeLineAt`). Nothing is added to the layout, so no content moves and no overlay is created — visible overlays would make the owning editor release mouse ownership. Message boxes pad themselves with background-filled blank rows, so those are never used; if no clean row exists in the bottom few, the toast is skipped for that frame rather than punching a hole in a box.
 
 Hook ownership matters here. Editors like pi-powerline-footer tear down and rebuild their own render hook (first keypress, `/powerline ...`, resizes), and `/reload` re-imports this extension while the TUI object survives. The hooks are therefore stored on the TUI under a global symbol: the render hook is re-asserted as the outermost wrapper on every input, and a reloaded instance takes ownership from the previous one instead of stacking on top of it or sitting idle behind it.
 

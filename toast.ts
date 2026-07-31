@@ -1,10 +1,14 @@
 /**
  * Bottom-right toast painting.
  *
- * The toast is composited onto the tail of an already rendered viewport line
+ * The toast is composited onto an already blank row of the rendered viewport
  * instead of occupying its own row. That keeps the layout perfectly stable (no
  * content shifting up and back down) and avoids TUI overlays, which make
  * terminal-splitting editors release mouse ownership while they are visible.
+ *
+ * Only genuinely empty, unstyled rows are used. Message boxes pad themselves with
+ * background-painted blank rows, and writing into one of those punches a hole in
+ * the box, so when no clean row is available the toast is skipped for that frame.
  */
 
 export interface ToastPaintOptions {
@@ -16,27 +20,34 @@ export interface ToastPaintOptions {
 	composite: (baseLine: string, overlayLine: string, startCol: number, overlayWidth: number, totalWidth: number) => string;
 	/** Columns kept free at the right edge. */
 	marginRight?: number;
-	/** How many bottom rows may be inspected for a blank tail. */
+	/** How many bottom rows may be inspected for a usable row. */
 	searchRows?: number;
 }
 
 const DEFAULT_MARGIN_RIGHT = 1;
-const DEFAULT_SEARCH_ROWS = 3;
+const DEFAULT_SEARCH_ROWS = 4;
 const ANSI_PATTERN = /\x1b\][^\x07]*(?:\x07|\x1b\\)|\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+/** Escapes that only reset state are harmless on an otherwise empty row. */
+const RESET_PATTERN = /^(?:\x1b\[0?m|\x1b\[49m|\x1b\[39m|\x1b\]8;;\x07)+$/;
 
 function stripAnsi(line: string): string {
 	return line.replace(ANSI_PATTERN, "");
 }
 
-/** True when columns `[startCol, endCol)` of `line` contain nothing but blanks. */
-function tailIsBlank(line: string, startCol: number, endCol: number): boolean {
-	const plain = stripAnsi(line);
-	return plain.slice(startCol, endCol).trim().length === 0 && plain.length <= endCol;
+/**
+ * True when the row carries no visible text and no styling that the toast would
+ * disturb (background fills, links, and similar).
+ */
+function isPaintableRow(line: string): boolean {
+	if (stripAnsi(line).trim().length > 0) return false;
+
+	const escapes = line.match(ANSI_PATTERN)?.join("") ?? "";
+	return escapes.length === 0 || RESET_PATTERN.test(escapes);
 }
 
 /**
  * Returns a copy of `lines` with the toast painted into the bottom-right corner,
- * or the original array when it does not fit.
+ * or the original rows when there is no clean row to use.
  */
 export function paintToast(lines: readonly string[], width: number, options: ToastPaintOptions): string[] {
 	const marginRight = options.marginRight ?? DEFAULT_MARGIN_RIGHT;
@@ -46,19 +57,18 @@ export function paintToast(lines: readonly string[], width: number, options: Toa
 	if (lines.length === 0 || labelWidth === 0) return [...lines];
 	if (labelWidth + marginRight >= width) return [...lines];
 
-	const startCol = width - labelWidth - marginRight;
-	const endCol = startCol + labelWidth;
-
-	// Prefer a bottom row whose tail is empty so nothing readable gets covered.
-	let target = lines.length - 1;
+	let target = -1;
 	for (let offset = 0; offset < Math.min(searchRows, lines.length); offset++) {
 		const index = lines.length - 1 - offset;
-		if (tailIsBlank(lines[index] ?? "", startCol, endCol)) {
+		if (isPaintableRow(lines[index] ?? "")) {
 			target = index;
 			break;
 		}
 	}
 
+	if (target === -1) return [...lines];
+
+	const startCol = width - labelWidth - marginRight;
 	const painted = [...lines];
 	painted[target] = options.composite(painted[target] ?? "", options.label, startCol, labelWidth, width);
 	return painted;

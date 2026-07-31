@@ -163,7 +163,8 @@ interface Harness {
 }
 
 function harness(overrides: Partial<CopyOnSelectConfig> = {}, options: { ownsMouse?: boolean; lines?: string[] } = {}): Harness {
-	const lines = options.lines ?? ["first chat line", "second chat line", "third chat line"];
+	// Real transcripts end with blank spacing; the toast needs a clean row.
+	const lines = options.lines ?? ["first chat line", "second chat line", "third chat line", ""];
 	const tui = new FakeTui(lines, { ownsMouse: options.ownsMouse });
 	const session = new FakeSession();
 	const clock = new Clock();
@@ -212,7 +213,7 @@ test("drag selection is copied, announced, and cleared immediately", () => {
 	assert.ok(toast, "toast is painted into the frame");
 	assert.match(toast, /✓ Copied to clipboard$/, "toast sits at the right edge");
 	assert.equal(measure(toast), VIEWPORT_WIDTH - 1, "one column stays free at the right edge");
-	assert.equal(h.frame().length, 3, "no extra row is added, so nothing shifts");
+	assert.equal(h.frame().length, 4, "no extra row is added, so nothing shifts");
 
 	h.clock.advance(DEFAULT_CONFIG.toastMs);
 	assert.equal(h.toastRow(), undefined, "toast disappears on its own");
@@ -321,7 +322,7 @@ test("selection is dropped when the viewport changes mid-drag", () => {
 	const h = harness();
 
 	h.tui.handleInput("\x1b[<0;1;1M");
-	h.tui.compositor.lines = ["scrolled line", "second chat line", "third chat line"];
+	h.tui.compositor.lines = ["scrolled line", "second chat line", "third chat line", ""];
 	h.frame();
 	h.tui.handleInput("\x1b[<32;6;1M");
 	h.tui.handleInput("\x1b[<0;6;1m");
@@ -440,6 +441,16 @@ test("status reports fade progress", () => {
 	assert.match(h.runtime.handleCommand("status", h.session).message, /fade idle/);
 });
 
+test("a frame without a clean row keeps the toast off screen", () => {
+	const busy = "x".repeat(40);
+	const h = harness({ clearSelection: "immediate" }, { lines: [busy, busy, busy, busy] });
+
+	h.drag(1, 1, 6, 1);
+
+	assert.deepEqual(h.clipboard, ["xxxxx"], "copying still works");
+	assert.equal(h.toastRow(), undefined, "no row is corrupted just to show a toast");
+});
+
 test("status reports hook and mouse ownership", () => {
 	const h = harness();
 	h.frame();
@@ -449,7 +460,7 @@ test("status reports hook and mouse ownership", () => {
 	assert.equal(status.level, "info");
 	assert.match(status.message, /hooks owned/);
 	assert.match(status.message, /mouse owned by editor/);
-	assert.match(status.message, /frame 3 rows/);
+	assert.match(status.message, /frame 4 rows/);
 });
 
 test("command toggles behavior and reports status", () => {
