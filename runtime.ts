@@ -31,7 +31,8 @@ export interface TerminalLike {
 }
 
 export interface TuiLike {
-	handleInput(data: string): void;
+	/** Some pi views render without processing input at all; treat it as absent then. */
+	handleInput?(data: string): void;
 	render?(width: number): string[];
 	requestRender?(): void;
 	hasOverlay?(): boolean;
@@ -232,9 +233,11 @@ export class CopyOnSelectRuntime {
 			return;
 		}
 
+		const handleInput = typeof tui.handleInput === "function" ? tui.handleInput.bind(tui) : null;
+
 		const hooks: TuiHooks = {
 			owner: this,
-			originalHandleInput: tui.handleInput.bind(tui),
+			originalHandleInput: handleInput ?? (() => {}),
 			renderWrapper: null,
 			replaying: false,
 			frame: [],
@@ -242,13 +245,15 @@ export class CopyOnSelectRuntime {
 		store[HOOKS_KEY] = hooks;
 		this.hooks = hooks;
 
-		tui.handleInput = (data: string): void => {
-			if (hooks.replaying) {
-				hooks.originalHandleInput(data);
-				return;
-			}
-			hooks.owner.onInput(tui, hooks, data);
-		};
+		if (handleInput) {
+			tui.handleInput = (data: string): void => {
+				if (hooks.replaying) {
+					hooks.originalHandleInput(data);
+					return;
+				}
+				hooks.owner.onInput(tui, hooks, data);
+			};
+		}
 
 		this.assertRenderHook(tui, hooks);
 	}

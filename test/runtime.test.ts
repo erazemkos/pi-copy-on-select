@@ -441,6 +441,30 @@ test("status reports fade progress", () => {
 	assert.match(h.runtime.handleCommand("status", h.session).message, /fade idle/);
 });
 
+test("a TUI view without handleInput installs without crashing", () => {
+	const tui = new FakeTui(["first chat line", "second chat line", "third chat line", ""]);
+	// Views like passive widgets render without ever processing input, so they
+	// expose no handleInput at all. Installing must not crash (#1).
+	(tui as { handleInput?: TuiLike["handleInput"] }).handleInput = undefined;
+	const session = new FakeSession();
+	const clock = new Clock();
+
+	const runtime = new CopyOnSelectRuntime({
+		measure,
+		copyToClipboard: async () => {},
+		readConfig: () => ({ ...DEFAULT_CONFIG }),
+		setTimer: clock.set,
+		clearTimer: clock.clear,
+	});
+
+	runtime.startSession(session);
+	const capture = session.widgets.get("copy-on-select-capture");
+	assert.ok(capture, "capture widget must be registered in tui mode");
+
+	assert.doesNotThrow(() => capture(tui, session.ui.theme), "install must tolerate a TUI without handleInput");
+	assert.equal(typeof tui.render, "function", "render hook is still installed");
+});
+
 test("a frame without a clean row keeps the toast off screen", () => {
 	const busy = "x".repeat(40);
 	const h = harness({ clearSelection: "immediate" }, { lines: [busy, busy, busy, busy] });

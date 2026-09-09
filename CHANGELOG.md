@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `Cannot read properties of undefined (reading 'bind')` crashing pi on
+  startup (#1). Some pi views render without ever processing input and expose no
+  `handleInput` at all; `install` now treats it as absent, skips input wrapping,
+  and still installs the render hook.
+
 ## 0.5.0
 
 - Fixed the toast breaking message boxes. Boxes pad themselves with
