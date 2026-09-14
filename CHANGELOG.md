@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Fixed `Cannot read properties of undefined (reading 'bind')` crashing pi on
+  startup (#1). Input capture now supports current pi's renamed dispatcher and
+  public input-listener API while retaining a fallback for older releases.
+
 ## 0.5.0
 
 - Fixed the toast breaking message boxes. Boxes pad themselves with

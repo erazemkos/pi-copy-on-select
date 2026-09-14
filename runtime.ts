@@ -31,7 +31,10 @@ export interface TerminalLike {
 }
 
 export interface TuiLike {
-	handleInput(data: string): void;
+	/** Public TUI input-listener API used by current pi releases. */
+	addInputListener?(listener: (data: string) => void): () => void;
+	/** Legacy private dispatcher retained as a fallback for older pi releases. */
+	handleInput?(data: string): void;
 	render?(width: number): string[];
 	requestRender?(): void;
 	hasOverlay?(): boolean;
@@ -232,9 +235,18 @@ export class CopyOnSelectRuntime {
 			return;
 		}
 
+		const legacyHandleInput = typeof tui.handleInput === "function" ? tui.handleInput.bind(tui) : null;
+		// Current pi calls this private dispatcher `handleTerminalInput`. Wrapping it
+		// observes mouse packets before pi's built-in viewport listener consumes them
+		// and also provides the synthetic-click replay path.
+		const currentHandleInput = Reflect.get(tui as object, "handleTerminalInput");
+		const inputDispatcher = typeof currentHandleInput === "function"
+			? currentHandleInput.bind(tui) as (data: string) => void
+			: legacyHandleInput;
+
 		const hooks: TuiHooks = {
 			owner: this,
-			originalHandleInput: tui.handleInput.bind(tui),
+			originalHandleInput: inputDispatcher ?? (() => {}),
 			renderWrapper: null,
 			replaying: false,
 			frame: [],
@@ -242,13 +254,29 @@ export class CopyOnSelectRuntime {
 		store[HOOKS_KEY] = hooks;
 		this.hooks = hooks;
 
-		tui.handleInput = (data: string): void => {
+		const wrapInput = (data: string): void => {
 			if (hooks.replaying) {
 				hooks.originalHandleInput(data);
 				return;
 			}
-			hooks.owner.onInput(tui, hooks, data);
+			const copied = hooks.owner.onInput(tui, hooks, data);
+			hooks.originalHandleInput(data);
+			if (copied !== null) hooks.owner.onSelectionCopied(copied, tui, hooks);
 		};
+
+		if (typeof currentHandleInput === "function") {
+			// Wrap before pi's built-in viewport listener can consume mouse packets.
+			Reflect.set(tui as object, "handleTerminalInput", wrapInput);
+		} else if (typeof tui.addInputListener === "function") {
+			// Supported path for releases whose public listeners receive raw mouse input.
+			tui.addInputListener((data: string): void => {
+				if (hooks.replaying) return;
+				const copied = hooks.owner.onInput(tui, hooks, data);
+				if (copied !== null) hooks.owner.onSelectionCopied(copied, tui, hooks);
+			});
+		} else if (legacyHandleInput) {
+			tui.handleInput = wrapInput;
+		}
 
 		this.assertRenderHook(tui, hooks);
 	}
@@ -276,8 +304,8 @@ export class CopyOnSelectRuntime {
 		tui.render = hooks.renderWrapper;
 	}
 
-	/** Handles one raw input chunk before the TUI dispatches it. */
-	private onInput(tui: TuiLike, hooks: TuiHooks, data: string): void {
+	/** Observes one raw input chunk before the TUI dispatches it. */
+	private onInput(tui: TuiLike, hooks: TuiHooks, data: string): string | null {
 		this.assertRenderHook(tui, hooks);
 
 		const active = this.config.enabled && ownsMouseReporting(tui) && !hasVisibleOverlay(tui);
@@ -290,9 +318,7 @@ export class CopyOnSelectRuntime {
 			}
 		}
 
-		hooks.originalHandleInput(data);
-
-		if (copied !== null) this.onSelectionCopied(copied, tui, hooks);
+		return copied;
 	}
 
 	/**
