@@ -53,6 +53,7 @@ class FakeTui implements TuiLike {
 	compositor: FakeCompositor;
 	terminal: { rows: number; columns: number };
 	renderRequests = 0;
+	private inputListeners = new Set<(data: string) => void>();
 
 	constructor(lines: string[], { ownsMouse = true }: { ownsMouse?: boolean } = {}) {
 		this.compositor = new FakeCompositor(lines);
@@ -62,7 +63,17 @@ class FakeTui implements TuiLike {
 		}
 	}
 
-	handleInput(data: string): void {
+	addInputListener(listener: (data: string) => void): () => void {
+		this.inputListeners.add(listener);
+		return () => this.inputListeners.delete(listener);
+	}
+
+	emitInput(data: string): void {
+		for (const listener of this.inputListeners) listener(data);
+	}
+
+	handleTerminalInput(data: string): void {
+		this.emitInput(data);
 		if (this.compositor.handleInput(data)) return;
 		this.compositor.leakedToEditor.push(data);
 	}
@@ -190,9 +201,9 @@ function harness(overrides: Partial<CopyOnSelectConfig> = {}, options: { ownsMou
 	frame();
 
 	const drag = (fromCol: number, fromRow: number, toCol: number, toRow: number): void => {
-		tui.handleInput(`\x1b[<0;${fromCol};${fromRow}M`);
-		tui.handleInput(`\x1b[<32;${toCol};${toRow}M`);
-		tui.handleInput(`\x1b[<0;${toCol};${toRow}m`);
+		tui.handleTerminalInput(`\x1b[<0;${fromCol};${fromRow}M`);
+		tui.handleTerminalInput(`\x1b[<32;${toCol};${toRow}M`);
+		tui.handleTerminalInput(`\x1b[<0;${toCol};${toRow}m`);
 	};
 
 	const toastRow = (): string | undefined => frame().find((line) => line.includes("Copied to clipboard"));
@@ -290,9 +301,9 @@ test("disabled config leaves mouse handling and the frame untouched", () => {
 test("plain clicks and wheel scrolling copy nothing", () => {
 	const h = harness();
 
-	h.tui.handleInput("\x1b[<0;4;2M");
-	h.tui.handleInput("\x1b[<0;4;2m");
-	h.tui.handleInput("\x1b[<64;4;2M");
+	h.tui.handleTerminalInput("\x1b[<0;4;2M");
+	h.tui.handleTerminalInput("\x1b[<0;4;2m");
+	h.tui.handleTerminalInput("\x1b[<64;4;2M");
 
 	assert.deepEqual(h.clipboard, []);
 	assert.equal(h.toastRow(), undefined);
@@ -321,11 +332,11 @@ test("visible overlays suspend selection handling", () => {
 test("selection is dropped when the viewport changes mid-drag", () => {
 	const h = harness();
 
-	h.tui.handleInput("\x1b[<0;1;1M");
+	h.tui.handleTerminalInput("\x1b[<0;1;1M");
 	h.tui.compositor.lines = ["scrolled line", "second chat line", "third chat line", ""];
 	h.frame();
-	h.tui.handleInput("\x1b[<32;6;1M");
-	h.tui.handleInput("\x1b[<0;6;1m");
+	h.tui.handleTerminalInput("\x1b[<32;6;1M");
+	h.tui.handleTerminalInput("\x1b[<0;6;1m");
 
 	assert.deepEqual(h.clipboard, [], "stale text is never copied");
 });
@@ -441,18 +452,19 @@ test("status reports fade progress", () => {
 	assert.match(h.runtime.handleCommand("status", h.session).message, /fade idle/);
 });
 
-test("a TUI view without handleInput installs without crashing", () => {
+test("current TUI without handleInput installs render capture and copies selections", () => {
 	const tui = new FakeTui(["first chat line", "second chat line", "third chat line", ""]);
-	// Views like passive widgets render without ever processing input, so they
-	// expose no handleInput at all. Installing must not crash (#1).
-	(tui as { handleInput?: TuiLike["handleInput"] }).handleInput = undefined;
+	const originalRender = tui.render;
 	const session = new FakeSession();
 	const clock = new Clock();
+	const clipboard: string[] = [];
 
 	const runtime = new CopyOnSelectRuntime({
 		measure,
-		copyToClipboard: async () => {},
-		readConfig: () => ({ ...DEFAULT_CONFIG }),
+		copyToClipboard: async (text) => {
+			clipboard.push(text);
+		},
+		readConfig: () => ({ ...DEFAULT_CONFIG, clearSelection: "keep", toast: false }),
 		setTimer: clock.set,
 		clearTimer: clock.clear,
 	});
@@ -460,9 +472,37 @@ test("a TUI view without handleInput installs without crashing", () => {
 	runtime.startSession(session);
 	const capture = session.widgets.get("copy-on-select-capture");
 	assert.ok(capture, "capture widget must be registered in tui mode");
+	assert.doesNotThrow(() => capture(tui, session.ui.theme), "install must tolerate the current dispatcher name");
+	assert.notEqual(tui.render, originalRender, "render hook is installed");
 
-	assert.doesNotThrow(() => capture(tui, session.ui.theme), "install must tolerate a TUI without handleInput");
-	assert.equal(typeof tui.render, "function", "render hook is still installed");
+	tui.render!(VIEWPORT_WIDTH);
+	tui.handleTerminalInput("\x1b[<0;1;1M");
+	tui.handleTerminalInput("\x1b[<32;6;1M");
+	tui.handleTerminalInput("\x1b[<0;6;1m");
+	assert.deepEqual(clipboard, ["first"], "current input path receives mouse packets and copies selection");
+});
+
+test("listener-only TUI captures input without a private dispatcher", () => {
+	const tui = new FakeTui(["first chat line", ""]);
+	(tui as { handleTerminalInput?: (data: string) => void }).handleTerminalInput = undefined;
+	const session = new FakeSession();
+	const clipboard: string[] = [];
+	const runtime = new CopyOnSelectRuntime({
+		measure,
+		copyToClipboard: async (text) => {
+			clipboard.push(text);
+		},
+		readConfig: () => ({ ...DEFAULT_CONFIG, clearSelection: "keep", toast: false }),
+	});
+
+	runtime.startSession(session);
+	session.widgets.get("copy-on-select-capture")?.(tui, session.ui.theme);
+	tui.render!(VIEWPORT_WIDTH);
+	tui.emitInput("\x1b[<0;1;1M");
+	tui.emitInput("\x1b[<32;6;1M");
+	tui.emitInput("\x1b[<0;6;1m");
+
+	assert.deepEqual(clipboard, ["first"], "public listener receives mouse packets");
 });
 
 test("a frame without a clean row keeps the toast off screen", () => {

@@ -3,9 +3,8 @@
 ## Unreleased
 
 - Fixed `Cannot read properties of undefined (reading 'bind')` crashing pi on
-  startup (#1). Some pi views render without ever processing input and expose no
-  `handleInput` at all; `install` now treats it as absent, skips input wrapping,
-  and still installs the render hook.
+  startup (#1). Input capture now supports current pi's renamed dispatcher and
+  public input-listener API while retaining a fallback for older releases.
 
 ## 0.5.0
 
