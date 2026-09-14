@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.5.1
 
 - Fixed `Cannot read properties of undefined (reading 'bind')` crashing pi on
   startup (#1). Input capture now supports current pi's renamed dispatcher and
