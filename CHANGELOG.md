@@ -1,5 +1,15 @@
 # Changelog
 
+## Deprecated
+
+- Project deprecated. Current Pi provides native fullscreen copy-on-select and a
+  built-in confirmation flash.
+- Regular-mode selection is owned by the terminal emulator, so Pi extensions do
+  not receive selected text or a selection-complete event. Supporting it would
+  require replacing terminal selection and effectively rebuilding fullscreen.
+- No further releases are planned. Published npm versions remain available only
+  for reproducibility and are marked deprecated.
+
 ## 0.5.1
 
 - Fixed `Cannot read properties of undefined (reading 'bind')` crashing pi on
